@@ -19,6 +19,8 @@ pub fn run_daemon(args: Cli) -> Result<()> {
         target_ip4 = %args.ip4,
         target_ip6 = %args.ip6,
         metric = args.metric,
+        table = args.table,
+        default_route = args.default_route,
         interval_secs = args.interval,
         timeout_ms = args.timeout,
         no_conntrack_flush = args.no_conntrack_flush,
@@ -111,15 +113,15 @@ fn process_family(
     let mut health_map = HashMap::new();
 
     for iface in &args.interfaces {
-        let is_healthy = pinger::check_interface_health(iface, target_ip, timeout, args.count);
-        health_map.insert(iface.clone(), is_healthy);
+        let is_healthy = pinger::check_interface_health(&iface.name, target_ip, timeout, args.count);
+        health_map.insert(iface.name.clone(), is_healthy);
     }
 
     // Find highest priority healthy interface
     let best_healthy = args
         .interfaces
         .iter()
-        .find(|&iface| health_map.get(iface).copied().unwrap_or(false));
+        .find(|iface| health_map.get(&iface.name).copied().unwrap_or(false));
 
     match best_healthy {
         None => {
@@ -130,13 +132,20 @@ fn process_family(
             );
             false
         }
-        Some(target_dev) => {
-            // Get current effective routing
-            let current_effective = match router::get_current_effective_route(family) {
+        Some(target_config) => {
+            let target_dev = &target_config.name;
+
+            // Check current effective routing
+            let current_effective = match router::get_current_effective_route(
+                family,
+                args.default_route,
+                args.table,
+            ) {
                 Ok(eff) => eff,
                 Err(e) => {
                     error!(
                         family = family_name,
+                        table = args.table,
                         error = %e,
                         "Failed to query current effective routing"
                     );
@@ -144,92 +153,183 @@ fn process_family(
                 }
             };
 
-            // Get default route info for the target healthy interface
-            match router::get_default_route_for_dev(target_dev, family) {
-                Ok(Some(dev_route)) => {
-                    let target_gw = dev_route.gateway.as_deref();
+            // Check if custom route parameters were specified in positional arguments
+            let custom_params = match family {
+                IpFamily::V4 => target_config.ipv4_route_params.as_deref(),
+                IpFamily::V6 => target_config.ipv6_route_params.as_deref(),
+            };
 
-                    if router::is_effective_route_matched(
-                        current_effective.as_ref(),
-                        target_dev,
-                        target_gw,
-                        args.metric,
-                    ) {
-                        if last_reported.as_deref() != Some(target_dev.as_str()) {
-                            info!(
-                                family = family_name,
-                                interface = %target_dev,
-                                gateway = ?target_gw,
-                                metric = args.metric,
-                                "Active WAN interface is healthy"
-                            );
-                            *last_reported = Some(target_dev.clone());
-                        } else {
-                            debug!(
-                                family = family_name,
-                                interface = %target_dev,
-                                "Active WAN route unchanged and healthy"
-                            );
-                        }
-                        false
-                    } else {
-                        let old_desc = current_effective
-                            .as_ref()
-                            .map(|c| format!("{} (via {:?})", c.dev, c.gateway))
-                            .unwrap_or_else(|| "none".to_string());
+            if let Some(params) = custom_params {
+                let target_gw = router::extract_gateway_from_params(params);
 
+                if router::is_effective_route_matched(
+                    current_effective.as_ref(),
+                    target_dev,
+                    target_gw,
+                    args.metric,
+                ) {
+                    if last_reported.as_deref() != Some(target_dev.as_str()) {
                         info!(
                             family = family_name,
-                            previous = %old_desc,
-                            target_dev = %target_dev,
-                            gateway = ?target_gw,
+                            interface = %target_dev,
+                            custom_params = %params,
                             metric = args.metric,
-                            "Failover: updating effective routing..."
+                            table = args.table,
+                            "Active WAN interface is healthy"
                         );
+                        *last_reported = Some(target_dev.clone());
+                    } else {
+                        debug!(
+                            family = family_name,
+                            interface = %target_dev,
+                            "Active WAN route unchanged and healthy"
+                        );
+                    }
+                    false
+                } else {
+                    let old_desc = current_effective
+                        .as_ref()
+                        .map(|c| format!("{} (via {:?})", c.dev, c.gateway))
+                        .unwrap_or_else(|| "none".to_string());
 
-                        if let Err(e) = router::replace_effective_routes(
+                    info!(
+                        family = family_name,
+                        previous = %old_desc,
+                        target_dev = %target_dev,
+                        custom_params = %params,
+                        metric = args.metric,
+                        table = args.table,
+                        default_route = args.default_route,
+                        "Failover: updating effective routing..."
+                    );
+
+                    if let Err(e) = router::replace_effective_routes(
+                        target_dev,
+                        Some(params),
+                        None,
+                        args.metric,
+                        args.table,
+                        family,
+                        args.default_route,
+                        args.dry_run,
+                    ) {
+                        error!(
+                            family = family_name,
+                            error = %e,
+                            target_dev = %target_dev,
+                            "Failed to update effective routes"
+                        );
+                        false
+                    } else {
+                        info!(
+                            family = family_name,
+                            target_dev = %target_dev,
+                            custom_params = %params,
+                            metric = args.metric,
+                            table = args.table,
+                            "Successfully updated effective routing to active WAN"
+                        );
+                        *last_reported = Some(target_dev.clone());
+                        true
+                    }
+                }
+            } else {
+                // If custom parameters not provided, lookup default route from ip route show
+                match router::get_default_route_for_dev(target_dev, family, args.table) {
+                    Ok(Some(dev_route)) => {
+                        let target_gw = dev_route.gateway.as_deref();
+
+                        if router::is_effective_route_matched(
+                            current_effective.as_ref(),
                             target_dev,
                             target_gw,
                             args.metric,
-                            family,
-                            args.dry_run,
                         ) {
-                            error!(
-                                family = family_name,
-                                error = %e,
-                                target_dev = %target_dev,
-                                "Failed to update effective routes"
-                            );
+                            if last_reported.as_deref() != Some(target_dev.as_str()) {
+                                info!(
+                                    family = family_name,
+                                    interface = %target_dev,
+                                    gateway = ?target_gw,
+                                    metric = args.metric,
+                                    table = args.table,
+                                    "Active WAN interface is healthy"
+                                );
+                                *last_reported = Some(target_dev.clone());
+                            } else {
+                                debug!(
+                                    family = family_name,
+                                    interface = %target_dev,
+                                    "Active WAN route unchanged and healthy"
+                                );
+                            }
                             false
                         } else {
+                            let old_desc = current_effective
+                                .as_ref()
+                                .map(|c| format!("{} (via {:?})", c.dev, c.gateway))
+                                .unwrap_or_else(|| "none".to_string());
+
                             info!(
                                 family = family_name,
+                                previous = %old_desc,
                                 target_dev = %target_dev,
                                 gateway = ?target_gw,
                                 metric = args.metric,
-                                "Successfully updated effective routing to active WAN"
+                                table = args.table,
+                                default_route = args.default_route,
+                                "Failover: updating effective routing..."
                             );
-                            *last_reported = Some(target_dev.clone());
-                            true
+
+                            if let Err(e) = router::replace_effective_routes(
+                                target_dev,
+                                None,
+                                target_gw,
+                                args.metric,
+                                args.table,
+                                family,
+                                args.default_route,
+                                args.dry_run,
+                            ) {
+                                error!(
+                                    family = family_name,
+                                    error = %e,
+                                    target_dev = %target_dev,
+                                    "Failed to update effective routes"
+                                );
+                                false
+                            } else {
+                                info!(
+                                    family = family_name,
+                                    target_dev = %target_dev,
+                                    gateway = ?target_gw,
+                                    metric = args.metric,
+                                    table = args.table,
+                                    "Successfully updated effective routing to active WAN"
+                                );
+                                *last_reported = Some(target_dev.clone());
+                                true
+                            }
                         }
                     }
-                }
-                Ok(None) => {
-                    warn!(
-                        family = family_name,
-                        interface = %target_dev,
-                        "Interface is healthy but has no default route in routing table"
-                    );
-                    false
-                }
-                Err(e) => {
-                    error!(
-                        family = family_name,
-                        interface = %target_dev,
-                        error = %e,
-                        "Failed to get default route for interface"
-                    );
-                    false
+                    Ok(None) => {
+                        warn!(
+                            family = family_name,
+                            interface = %target_dev,
+                            table = args.table,
+                            "Interface is healthy but has no default route in routing table"
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        error!(
+                            family = family_name,
+                            interface = %target_dev,
+                            table = args.table,
+                            error = %e,
+                            "Failed to get default route for interface"
+                        );
+                        false
+                    }
                 }
             }
         }

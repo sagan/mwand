@@ -17,17 +17,31 @@ impl IpFamily {
         }
     }
 
-    pub fn primary_effective_subnet(&self) -> &'static str {
-        match self {
-            IpFamily::V4 => "0.0.0.0/1",
-            IpFamily::V6 => "::/1",
+    pub fn primary_effective_subnet(&self, default_route: bool) -> &'static str {
+        if default_route {
+            match self {
+                IpFamily::V4 => "0.0.0.0/0",
+                IpFamily::V6 => "::/0",
+            }
+        } else {
+            match self {
+                IpFamily::V4 => "0.0.0.0/1",
+                IpFamily::V6 => "::/1",
+            }
         }
     }
 
-    pub fn split_subnets(&self) -> [&'static str; 2] {
-        match self {
-            IpFamily::V4 => ["0.0.0.0/1", "128.0.0.0/1"],
-            IpFamily::V6 => ["::/1", "8000::/1"],
+    pub fn subnets(&self, default_route: bool) -> Vec<&'static str> {
+        if default_route {
+            match self {
+                IpFamily::V4 => vec!["0.0.0.0/0"],
+                IpFamily::V6 => vec!["::/0"],
+            }
+        } else {
+            match self {
+                IpFamily::V4 => vec!["0.0.0.0/1", "128.0.0.0/1"],
+                IpFamily::V6 => vec!["::/1", "8000::/1"],
+            }
         }
     }
 }
@@ -49,17 +63,40 @@ pub struct EffectiveRoute {
     pub metric: u32,
 }
 
-/// Executes `ip <family> -j route show default dev <interface>` and returns the first default route.
+/// Extracts the gateway string from custom routing params if "via <gateway>" is present.
+pub fn extract_gateway_from_params(params: &str) -> Option<&str> {
+    let mut iter = params.split_whitespace();
+    while let Some(word) = iter.next() {
+        if word == "via" {
+            return iter.next();
+        }
+    }
+    None
+}
+
+/// Executes `ip <family> -j route show default dev <interface> table <table>` and returns the first default route.
 pub fn get_default_route_for_dev(
     interface: &str,
     family: IpFamily,
+    table: u32,
 ) -> Result<Option<RouteEntry>> {
+    let table_str = table.to_string();
     let output = Command::new("ip")
-        .args([family.flag(), "-j", "route", "show", "default", "dev", interface])
+        .args([
+            family.flag(),
+            "-j",
+            "route",
+            "show",
+            "default",
+            "dev",
+            interface,
+            "table",
+            &table_str,
+        ])
         .output()
         .with_context(|| {
             format!(
-                "failed to execute 'ip {} -j route show default dev {interface}'",
+                "failed to execute 'ip {} -j route show default dev {interface} table {table_str}'",
                 family.flag()
             )
         })?;
@@ -67,9 +104,10 @@ pub fn get_default_route_for_dev(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
-            "ip {} route show default dev {} returned error (code {:?}): {}",
+            "ip {} route show default dev {} table {} returned error (code {:?}): {}",
             family.flag(),
             interface,
+            table_str,
             output.status.code(),
             stderr.trim()
         );
@@ -82,7 +120,7 @@ pub fn get_default_route_for_dev(
 
     let routes: Vec<RouteEntry> = serde_json::from_str(&stdout).with_context(|| {
         format!(
-            "failed to parse JSON from 'ip {} -j route show default dev {interface}': {stdout}",
+            "failed to parse JSON from 'ip {} -j route show default dev {interface} table {table_str}': {stdout}",
             family.flag()
         )
     })?;
@@ -91,15 +129,28 @@ pub fn get_default_route_for_dev(
     Ok(routes.into_iter().next())
 }
 
-/// Executes `ip <family> -j route show <primary_subnet>` and returns the current effective routing.
-pub fn get_current_effective_route(family: IpFamily) -> Result<Option<EffectiveRoute>> {
-    let subnet = family.primary_effective_subnet();
+/// Executes `ip <family> -j route show <subnet> table <table>` and returns current effective routing.
+pub fn get_current_effective_route(
+    family: IpFamily,
+    default_route: bool,
+    table: u32,
+) -> Result<Option<EffectiveRoute>> {
+    let subnet = family.primary_effective_subnet(default_route);
+    let table_str = table.to_string();
     let output = Command::new("ip")
-        .args([family.flag(), "-j", "route", "show", subnet])
+        .args([
+            family.flag(),
+            "-j",
+            "route",
+            "show",
+            subnet,
+            "table",
+            &table_str,
+        ])
         .output()
         .with_context(|| {
             format!(
-                "failed to execute 'ip {} -j route show {subnet}'",
+                "failed to execute 'ip {} -j route show {subnet} table {table_str}'",
                 family.flag()
             )
         })?;
@@ -107,9 +158,10 @@ pub fn get_current_effective_route(family: IpFamily) -> Result<Option<EffectiveR
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
-            "ip {} route show {} returned error (code {:?}): {}",
+            "ip {} route show {} table {} returned error (code {:?}): {}",
             family.flag(),
             subnet,
+            table_str,
             output.status.code(),
             stderr.trim()
         );
@@ -122,7 +174,7 @@ pub fn get_current_effective_route(family: IpFamily) -> Result<Option<EffectiveR
 
     let routes: Vec<RouteEntry> = serde_json::from_str(&stdout).with_context(|| {
         format!(
-            "failed to parse JSON from 'ip {} -j route show {subnet}': {stdout}",
+            "failed to parse JSON from 'ip {} -j route show {subnet} table {table_str}': {stdout}",
             family.flag()
         )
     })?;
@@ -160,18 +212,35 @@ pub fn is_effective_route_matched(
 /// Updates system effective routing via `ip <family> route replace`.
 pub fn replace_effective_routes(
     target_dev: &str,
+    custom_params: Option<&str>,
     gateway: Option<&str>,
     metric: u32,
+    table: u32,
     family: IpFamily,
+    default_route: bool,
     dry_run: bool,
 ) -> Result<()> {
-    let subnets = family.split_subnets();
+    let subnets = family.subnets(default_route);
+    let table_str = table.to_string();
 
     for subnet in subnets {
         let mut cmd = Command::new("ip");
-        cmd.args([family.flag(), "route", "replace", subnet, "dev", target_dev]);
+        cmd.args([
+            family.flag(),
+            "route",
+            "replace",
+            subnet,
+            "table",
+            &table_str,
+            "dev",
+            target_dev,
+        ]);
 
-        if let Some(gw) = gateway {
+        if let Some(params) = custom_params {
+            for token in params.split_whitespace() {
+                cmd.arg(token);
+            }
+        } else if let Some(gw) = gateway {
             cmd.args(["via", gw]);
         }
 
@@ -240,6 +309,24 @@ pub fn flush_conntrack(dry_run: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extract_gateway_from_params() {
+        assert_eq!(
+            extract_gateway_from_params("via 172.24.1.254"),
+            Some("172.24.1.254")
+        );
+        assert_eq!(
+            extract_gateway_from_params("via 172.24.1.254 onlink"),
+            Some("172.24.1.254")
+        );
+        assert_eq!(
+            extract_gateway_from_params("via fe80::1"),
+            Some("fe80::1")
+        );
+        assert_eq!(extract_gateway_from_params("proto static"), None);
+        assert_eq!(extract_gateway_from_params(""), None);
+    }
 
     #[test]
     fn test_parse_default_route_json() {
